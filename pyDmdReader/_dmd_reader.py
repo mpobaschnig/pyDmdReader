@@ -12,6 +12,8 @@ from . import _api
 from .types import ChannelType, SampleType, DataFrameColumn, TimestampFormat
 from .data_types import HeaderField, MarkerEvent, MarkerEventType, MarkerEventSource, Version
 from ._channel_config import ChannelConfig
+from ._structures import DmdDigitalSampleTimestamp, DmdSampleValueComplex
+from ctypes import c_double
 from typing import List, Dict, Tuple, Union, Optional, TYPE_CHECKING
 if TYPE_CHECKING:
     from .data_types import Sweep
@@ -381,6 +383,26 @@ class DmdReader:
 
         raise TypeError("Channel should be referenced with string-name or int-ids")
 
+    def __init_sample_and_timestamp_arrays(self, ch_config: ChannelConfig, block_size: int):
+        max_sample_dimension = ch_config.max_sample_dimension
+
+        if ch_config.raw_sample_type == SampleType.DOUBLE:
+            sample_values = (c_double * block_size)()
+            timestamp_values = (c_double * block_size)()
+        elif ch_config.raw_sample_type == SampleType.SINT32:
+            sample_values = (DmdDigitalSampleTimestamp * block_size)()
+        elif ch_config.raw_sample_type == SampleType.DOUBLE_VECTOR:
+            sample_values = (c_double * (block_size * max_sample_dimension))()
+            timestamp_values = (c_double * block_size)()
+        elif ch_config.raw_sample_type == SampleType.COMPLEX_VECTOR:
+            sample_values = (DmdSampleValueComplex * (block_size * max_sample_dimension))()
+            timestamp_values = (c_double * block_size)()
+        else:
+            raise NotImplementedError(f"Sampletype {ch_config.raw_sample_type} not supported")
+
+        return sample_values, timestamp_values
+
+
     def __get_all_sweeps(self, ch_config: ChannelConfig, max_samples:int = None) -> Tuple[np.ndarray, np.ndarray]:
         """Get data from all sweeps of given ch_config"""
         data = np.array([], dtype=ch_config.dtype)
@@ -394,6 +416,7 @@ class DmdReader:
                 break
 
             # HINT: Splitting up blocks is needed for async channels to reduce memory allocation
+            old_max_sweep_samples: int = 0
             while first_sample <= sweep.last_sample:
                 if sweep.last_sample - first_sample + 1 >= block_size:
                     max_sweep_samples = block_size
@@ -403,11 +426,20 @@ class DmdReader:
                 if max_samples is not None:
                     max_sweep_samples = min(max_sweep_samples, max_samples)
 
-                raw_timestamps, raw_values, next_sample = self.__get_single_sweep(ch_config, first_sample, max_sweep_samples)
+                if old_max_sweep_samples != max_sweep_samples:
+                    sample_values, timestamp_values = self.__init_sample_and_timestamp_arrays(ch_config,
+                                                                                              max_sweep_samples)
+
+                raw_timestamps, raw_values, next_sample = self.__get_single_sweep(ch_config,
+                                                                                  first_sample,
+                                                                                  max_sweep_samples,
+                                                                                  sample_values,
+                                                                                  timestamp_values)
                 data = np.r_[data, raw_values]
                 timestamps = np.r_[timestamps, raw_timestamps]
 
                 first_sample = next_sample
+                old_max_sweep_samples = max_sweep_samples
 
                 if max_samples is not None:
                     # subtract used-up samples
@@ -426,8 +458,10 @@ class DmdReader:
 
         timestamps = np.array([], dtype="float64")
         data = np.array([])
+        block_size = 1000000
 
         # Get data from suitable sweeps
+        old_max_sweep_samples: int = 0
         for sweep in ch_config.sweeps:
             if max_samples == 0:
                 break
@@ -438,10 +472,16 @@ class DmdReader:
                     end_sample = int(actual_end_time * sweep.sample_frequency)
                     first_sample, max_sweep_samples = self.__get_corrected_sample_count(sweep, start_sample, end_sample)
 
+                    sample_values, timestamp_values = self.__init_sample_and_timestamp_arrays(ch_config,
+                                                                                              max_samples)
+
                     if max_samples is not None:
                         max_sweep_samples = min(max_sweep_samples, max_samples)
-
-                    sweep_timestamps, sweep_data, *_ = self.__get_single_sweep(ch_config, first_sample, max_sweep_samples)
+                    sweep_timestamps, sweep_data, *_ = self.__get_single_sweep(ch_config,
+                                                                               first_sample,
+                                                                               max_sweep_samples,
+                                                                               sample_values,
+                                                                               timestamp_values)
                     timestamps = np.r_[timestamps, sweep_timestamps]
                     data = np.r_[data, sweep_data]
 
@@ -465,8 +505,12 @@ class DmdReader:
                         if max_samples is not None:
                             block_max_samples = min(block_max_samples, max_samples)
 
+                        if old_max_sweep_samples != max_sweep_samples:
+                            sample_values, timestamp_values = self.__init_sample_and_timestamp_arrays(ch_config,
+                                                                                                      max_samples)
+
                         raw_timestamps, raw_values, next_sample = self.__get_single_sweep(
-                            ch_config, first_sample, block_max_samples
+                            ch_config, first_sample, block_max_samples, sample_values, timestamp_values
                         )
 
                         if len(raw_timestamps) > 0:
@@ -488,12 +532,14 @@ class DmdReader:
                                     break
 
                         first_sample = next_sample
+                        old_max_sweep_samples = max_sweep_samples
 
         return timestamps, data
 
     @staticmethod
     def __get_single_sweep(
-        ch_config: ChannelConfig, first_sample: int, max_samples: int
+        ch_config: ChannelConfig, first_sample: int, max_samples: int,
+        sample_values: "Array", timestamp_values: "Array"
     ) -> Tuple[np.ndarray, np.ndarray, int]:
         """Get data for given sweep of given channel"""
         timestamps_dtype = "float64"
@@ -501,28 +547,36 @@ class DmdReader:
             num_valid_samples, next_sample, raw_values, raw_timestamps = _api.get_samples_and_ts_scaled_value_seconds(
                 ch_config.handle,
                 first_sample,
-                max_samples
+                max_samples,
+                sample_values,
+                timestamp_values
             )
         elif ch_config.raw_sample_type == SampleType.SINT32:
             # Digital
             num_valid_samples, next_sample, raw_values, raw_timestamps = _api.get_samples_and_ts_digital_value_seconds(
                 ch_config.handle,
                 first_sample,
-                max_samples
+                max_samples,
+                sample_values,
+                timestamp_values
             )
         elif ch_config.raw_sample_type == SampleType.DOUBLE_VECTOR:
             num_valid_samples, next_sample, raw_values, raw_timestamps = _api.get_samples_and_ts_scalar_vector_seconds(
                 ch_config.handle,
                 first_sample,
                 max_samples,
-                ch_config.max_sample_dimension
+                ch_config.max_sample_dimension,
+                sample_values,
+                timestamp_values
             )
         elif ch_config.raw_sample_type == SampleType.COMPLEX_VECTOR:
             num_valid_samples, next_sample, raw_values, raw_timestamps = _api.get_samples_and_ts_complex_vector_seconds(
                 ch_config.handle,
                 first_sample,
                 max_samples,
-                ch_config.max_sample_dimension
+                ch_config.max_sample_dimension,
+                sample_values,
+                timestamp_values
             )
         else:
             raise NotImplementedError(f"Sampletype {ch_config.raw_sample_type} not supported")
